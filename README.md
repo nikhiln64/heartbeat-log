@@ -22,4 +22,4 @@ The replication path - and the KIP-101 experiment - takes leadership appointment
 
 ## Status
 
-The red half of the experiment is live: `./gradlew redTest` deterministically loses two committed telemetry entries (seed 5, crash at t=67 - the pinned KIP-101 schedule), and an anomaly guard in the default suite keeps the reproduction honest in CI. Next: leader-epoch truncation - the fix - and the green twin on the identical seed. The git log is part of the deliverable and tells the build story in order.
+The experiment is complete. `./gradlew redTest` deterministically loses two committed telemetry entries under the pre-KIP-101 rule (seed 5, crash at t=67); the green twin in the default suite replays the IDENTICAL schedule under `EPOCH_BOUNDARY` - Kafka's fix, built here from first principles - and loses nothing. Same seed, same faults, one variable changed: a controlled experiment, not two anecdotes. Remaining: the schedule fuzzer (stretch) and panel-prep polish. The git log tells the build story in order.

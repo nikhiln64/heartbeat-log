@@ -3,7 +3,9 @@ package heartbeatlog.replication;
 import heartbeatlog.core.Entry;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * The promises notebook. The moment the acting leader advances its high
@@ -19,9 +21,16 @@ import java.util.List;
 public final class CommitLedger {
 
     private final List<Entry> committed = new ArrayList<>();
+    private final Set<Entry> seen = new HashSet<>();
 
     void recordCommitted(Entry entry) {
-        committed.add(entry);
+        // Idempotent: a new leader whose stale watermark re-advances over
+        // already-committed entries re-promises them - same promise, not a
+        // new one. Distinct entries at the same offset (the red run's
+        // epoch-2 overwrites) are different promises and are all kept.
+        if (seen.add(entry)) {
+            committed.add(entry);
+        }
     }
 
     /** Every entry the cluster ever claimed was safe, in commit order. */

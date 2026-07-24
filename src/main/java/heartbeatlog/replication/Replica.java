@@ -136,6 +136,8 @@ public final class Replica implements Node {
             case ClientAppend append -> onClientAppend(now, append);
             case FetchRequest fetch -> onFetchRequest(now, fetch);
             case FetchResponse response -> onFetchResponse(response);
+            case EpochEndRequest request -> onEpochEndRequest(request);
+            case EpochEndResponse response -> onEpochEndResponse(response);
             case Crash crash -> onCrash();
             case Recover recover -> List.of(); // not crashed - nothing to recover from
             default -> throw new IllegalArgumentException("replica " + id + ": unknown event " + event);
@@ -182,6 +184,12 @@ public final class Replica implements Node {
             // recipe the red test stages.
             log.subList((int) highWatermark, log.size()).clear();
         }
+        if (truncationRule == TruncationRule.EPOCH_BOUNDARY && !log.isEmpty()) {
+            // THE FIX: no guessing. Ask the new leader where our last
+            // epoch ends in ITS log and truncate exactly there. Committed
+            // entries survive; only divergent scribble is discarded.
+            return List.of(reconcileWithLeader());
+        }
         // Start the pull chain: ask for everything we don't have yet.
         return List.of(nextFetch());
     }
@@ -219,11 +227,21 @@ public final class Replica implements Node {
      * something new to say.
      */
     private List<Message> onFetchRequest(long now, FetchRequest fetch) {
-        if (fetch.epoch() < epoch || role != Role.LEADER) {
-            // Stale leadership or we aren't the leader (yet) - a real system
-            // answers with an error; here the failover schedule re-appoints
-            // and restarts the pull chain, so silence is safe.
+        if (fetch.epoch() < epoch) {
+            // Stale leadership: drop. (Fencing rule 1.)
             return List.of();
+        }
+        if (fetch.epoch() > epoch || role != Role.LEADER) {
+            // Either the requester knows a NEWER leadership than we do, or
+            // it believes we lead one we haven't heard of yet - in both
+            // cases the decree is still in flight somewhere. Serving with a
+            // stale epoch would get the response (rightly) dropped. Requeue
+            // the request to ourselves through the network (1-4 ticks) and
+            // re-handle it once the decree has had a chance to land.
+            // Bounded: the controller's decree always arrives in these
+            // schedules; without it the runaway backstop would flag the
+            // loop loudly rather than losing the request silently.
+            return List.of(new Message(id, id, fetch));
         }
         // The fetch IS the ack: fromOffset proves the follower holds
         // everything below it.
@@ -291,6 +309,12 @@ public final class Replica implements Node {
             return List.of();
         }
         if (response.fromOffset() < log.size()) {
+            if (truncationRule == TruncationRule.EPOCH_BOUNDARY) {
+                // Under the fix a batch can never legitimately start below
+                // our log end - if it does, our picture of the leader is
+                // stale. Reconcile properly instead of conforming blindly.
+                return List.of(reconcileWithLeader());
+            }
             // THE DESTRUCTION MOMENT of the buggy rule: the new leader's
             // log is shorter than ours, and we conform by cutting ours
             // down to match. If the cut range held committed entries, they
@@ -338,6 +362,11 @@ public final class Replica implements Node {
             log.subList((int) highWatermark, log.size()).clear();
         }
         if (leaderId != -1 && leaderId != id) {
+            if (truncationRule == TruncationRule.EPOCH_BOUNDARY && !log.isEmpty()) {
+                // THE FIX, restart half: nothing was torn on boot - ask the
+                // leader where our last epoch ends and cut exactly there.
+                return List.of(reconcileWithLeader());
+            }
             return List.of(nextFetch());
         }
         // We led before crashing (or never heard of a leader): wait for the
@@ -399,6 +428,63 @@ public final class Replica implements Node {
         }
         highWatermark = minimum;
         return answerWaitingFollowers(now);
+    }
+
+    /**
+     * LEADER side of reconciliation: answer "where does epoch E end in
+     * your log?" Same fencing and same decree-in-flight requeue as fetches.
+     */
+    private List<Message> onEpochEndRequest(EpochEndRequest request) {
+        if (request.epoch() < epoch) {
+            return List.of();
+        }
+        if (request.epoch() > epoch || role != Role.LEADER) {
+            // Decree in flight (ours or theirs) - requeue, same as fetches.
+            return List.of(new Message(id, id, request));
+        }
+        long endOffset = endOffsetForEpoch(log, request.queriedEpoch());
+        return List.of(new Message(id, request.followerId(),
+                new EpochEndResponse(epoch, request.queriedEpoch(), endOffset)));
+    }
+
+    /**
+     * FOLLOWER side of reconciliation: cut the log exactly at the boundary
+     * the leader named - everything below is shared history, everything
+     * above is divergent scribble from a dead leadership - then resume
+     * fetching from the cut.
+     */
+    private List<Message> onEpochEndResponse(EpochEndResponse response) {
+        if (response.epoch() < epoch || role != Role.FOLLOWER) {
+            return List.of();
+        }
+        long cutAt = Math.min(log.size(), response.endOffset());
+        if (cutAt < log.size()) {
+            log.subList((int) cutAt, log.size()).clear();
+        }
+        highWatermark = Math.min(highWatermark, log.size());
+        return List.of(nextFetch());
+    }
+
+    /** Builds this follower's reconciliation question about its last epoch. */
+    private Message reconcileWithLeader() {
+        long lastEpochInLog = log.get(log.size() - 1).epoch();
+        return new Message(id, leaderId, new EpochEndRequest(epoch, id, lastEpochInLog));
+    }
+
+    /**
+     * Where does {@code queriedEpoch} end in this log? The offset of the
+     * first entry stamped with a LARGER epoch - or the log end if no larger
+     * epoch exists. Pure function of the log, so the edge cases (epoch
+     * absent entirely, epoch older than the whole log, empty log) are unit
+     * tested directly.
+     */
+    static long endOffsetForEpoch(List<Entry> log, long queriedEpoch) {
+        for (Entry entry : log) {
+            if (entry.epoch() > queriedEpoch) {
+                return entry.offset();
+            }
+        }
+        return log.size();
     }
 
     /**

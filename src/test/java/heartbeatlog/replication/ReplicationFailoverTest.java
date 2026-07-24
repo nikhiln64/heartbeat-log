@@ -127,18 +127,24 @@ class ReplicationFailoverTest {
     @Test
     void belowMinInSyncTheLeaderRefusesWritesInsteadOfRiskingThem() {
         Cluster cluster = newCluster(24);
-        // Both followers die early; after LAG_LIMIT the roster is {0} alone.
+        // Both followers die early - but they die FULLY CAUGHT UP, and a
+        // silent, current follower is indistinguishable from a healthy idle
+        // one. The roster has no evidence against them until new data
+        // exists for them to fall behind on.
         cluster.simulation().schedule(20, 1, new Crash());
         cluster.simulation().schedule(20, 2, new Crash());
-        // First writes land while the roster still has everyone; the late
-        // ones (t >= 45 > 20 + LAG_LIMIT) meet a roster of one and must be
-        // refused - the cluster chooses unavailability over promises held
-        // by a single machine.
         for (int n = 0; n < 4; n++) {
             cluster.simulation().schedule(5 + 2L * n, 0, new ClientAppend("early-" + n));
         }
+        // The late block: the FIRST write legally lands (roster still holds
+        // the dead-but-current followers; accepting is faithful Kafka
+        // behavior - min.insync gates appends against the roster as known).
+        // That very write makes the dead followers demonstrably behind, so
+        // the next event evicts them, the roster collapses to {0}, and the
+        // remaining four writes are REFUSED - unavailability over promises
+        // held by a single machine.
         for (int n = 0; n < 5; n++) {
-            cluster.simulation().schedule(45 + 2L * n, 0, new ClientAppend("refused-" + n));
+            cluster.simulation().schedule(50 + 2L * n, 0, new ClientAppend("late-" + n));
         }
         // Recovery: followers return, catch up, roster heals - and a final
         // write commits again, proving refusal was a pause, not a wedge.
@@ -148,13 +154,16 @@ class ReplicationFailoverTest {
         cluster.simulation().run();
 
         Replica leader = cluster.replicas().get(0);
-        assertEquals(5, leader.refusedAppends(), "all five below-floor writes must be refused");
-        assertEquals(5, leader.log().size(), "4 early + 1 resumed; refused writes never enter the log");
-        assertEquals("resumed", leader.log().get(4).payload());
+        assertEquals(4, leader.refusedAppends(),
+                "late-1..late-4 must be refused; late-0 lands before the eviction evidence exists");
+        assertEquals(6, leader.log().size(), "4 early + late-0 + resumed");
+        assertEquals("late-0", leader.log().get(4).payload());
+        assertEquals("resumed", leader.log().get(5).payload());
         assertEquals(List.of(0, 1, 2), leader.inSyncReplicas(), "roster must heal after recovery");
-        assertEquals(5, leader.highWatermark());
+        assertEquals(6, leader.highWatermark());
         for (Entry promised : cluster.ledger().committed()) {
-            assertFalse(promised.payload().startsWith("refused-"), "a refused write must never be promised");
+            assertFalse(promised.payload().matches("late-[1-4]"),
+                    "a refused write must never be promised");
         }
         assertNoCommittedEntryLost(cluster, leader);
     }

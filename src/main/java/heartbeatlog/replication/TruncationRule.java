@@ -20,5 +20,20 @@ public enum TruncationRule {
      * that is Kafka's KIP-101 data-loss bug, reproduced by this project's
      * red test.
      */
-    HIGH_WATERMARK
+    HIGH_WATERMARK,
+
+    /**
+     * The fix Kafka shipped in 0.11 (KIP-101): don't guess with the
+     * watermark - ASK. Every entry is stamped with the leadership epoch it
+     * was written under, so a replica reconciling with a new leader asks
+     * "where does my last epoch end in YOUR log?" and truncates exactly
+     * there: divergent entries go, committed entries stay.
+     * <p>
+     * ELI5: instead of tearing out every page after the last "safe" call,
+     * the new copier asks the new teacher "your notebook - how far does
+     * teacher #3's handwriting go?" and keeps precisely that much. Pages
+     * everyone already copied are never torn; only genuinely divergent
+     * scribbles from a dead leadership are discarded.
+     */
+    EPOCH_BOUNDARY
 }
