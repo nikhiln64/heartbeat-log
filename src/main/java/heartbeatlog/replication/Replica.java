@@ -2,7 +2,9 @@ package heartbeatlog.replication;
 
 import heartbeatlog.core.Entry;
 import heartbeatlog.core.Role;
+import heartbeatlog.simulation.Crash;
 import heartbeatlog.simulation.Message;
+import heartbeatlog.simulation.Recover;
 import heartbeatlog.simulation.Node;
 
 import java.util.ArrayList;

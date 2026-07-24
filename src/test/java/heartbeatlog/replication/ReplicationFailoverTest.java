@@ -2,6 +2,8 @@ package heartbeatlog.replication;
 
 import heartbeatlog.core.Entry;
 import heartbeatlog.core.Role;
+import heartbeatlog.simulation.Crash;
+import heartbeatlog.simulation.Recover;
 import heartbeatlog.simulation.Simulation;
 import heartbeatlog.simulation.SimulatedNetwork;
 import heartbeatlog.simulation.TracePrinter;

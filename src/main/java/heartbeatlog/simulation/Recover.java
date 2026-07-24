@@ -1,7 +1,7 @@
-package heartbeatlog.replication;
+package heartbeatlog.simulation;
 
 /**
- * Scripted event: a crashed replica boots back up. It reloads its durable
+ * Scripted event: a crashed node boots back up. It reloads its durable
  * log, applies its truncation rule (under HIGH_WATERMARK it tears the log
  * back to the last watermark it knew - KIP-101's "restart" loss scenario
  * starts exactly here), comes back as a follower, and resumes pulling from
