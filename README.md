@@ -22,4 +22,4 @@ The replication path - and the KIP-101 experiment - takes leadership appointment
 
 ## Status
 
-Simulation engine and the happy-path replication protocol (leader append, follower pull, high watermark) are in. Next: failover with the buggy truncate-to-high-watermark rule, then the KIP-101 red/green experiment itself. The git log is part of the deliverable and tells the build story in order.
+Simulation engine, the replication protocol (leader append, follower pull, high watermark), and the failure machinery (crash/recover, in-sync roster with min-in-sync refusal, ControllerStub failover, and the deliberately-buggy truncate-to-high-watermark rule) are in. Next: the KIP-101 red/green experiment itself. The git log is part of the deliverable and tells the build story in order.
