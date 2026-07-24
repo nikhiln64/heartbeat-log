@@ -22,4 +22,4 @@ The replication path - and the KIP-101 experiment - takes leadership appointment
 
 ## Status
 
-Scaffold (H0-1 of the build plan). Protocol, simulation engine, and the experiment land in subsequent commits - the git log is part of the deliverable and tells the build story in order.
+Simulation engine and the happy-path replication protocol (leader append, follower pull, high watermark) are in. Next: failover with the buggy truncate-to-high-watermark rule, then the KIP-101 red/green experiment itself. The git log is part of the deliverable and tells the build story in order.
