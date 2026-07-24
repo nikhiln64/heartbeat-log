@@ -22,4 +22,4 @@ The replication path - and the KIP-101 experiment - takes leadership appointment
 
 ## Status
 
-Simulation engine, the replication protocol (leader append, follower pull, high watermark), and the failure machinery (crash/recover, in-sync roster with min-in-sync refusal, ControllerStub failover, and the deliberately-buggy truncate-to-high-watermark rule) are in. Next: the KIP-101 red/green experiment itself. The git log is part of the deliverable and tells the build story in order.
+The red half of the experiment is live: `./gradlew redTest` deterministically loses two committed telemetry entries (seed 5, crash at t=67 - the pinned KIP-101 schedule), and an anomaly guard in the default suite keeps the reproduction honest in CI. Next: leader-epoch truncation - the fix - and the green twin on the identical seed. The git log is part of the deliverable and tells the build story in order.
