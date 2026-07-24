@@ -173,6 +173,15 @@ public final class Replica implements Node {
             return List.of();
         }
         role = Role.FOLLOWER;
+        if (truncationRule == TruncationRule.HIGH_WATERMARK && log.size() > highWatermark) {
+            // BUGGY PRE-KIP-101 RULE, leadership-change half: before
+            // following a new leader, tear the log back to our own
+            // watermark. The torn entries may be COMMITTED (our watermark
+            // knowledge lags the cluster's by up to one round trip) - this
+            // tear plus a fast leadership bounce is the KIP-101 data-loss
+            // recipe the red test stages.
+            log.subList((int) highWatermark, log.size()).clear();
+        }
         // Start the pull chain: ask for everything we don't have yet.
         return List.of(nextFetch());
     }
@@ -242,6 +251,18 @@ public final class Replica implements Node {
 
         List<Message> out = new ArrayList<>(reviewInSyncRoster(now));
         out.addAll(advanceHighWatermark(now));
+        if (fetch.fromOffset() > log.size()) {
+            // The follower's log is LONGER than ours - it followed a
+            // previous leader further than we ever got. A reset response
+            // (empty, fromOffset = our log end) tells it where our log
+            // ends; under the buggy rule the follower then cuts itself
+            // down to match (pre-KIP-101 Kafka: OffsetOutOfRangeException
+            // handling). The epoch-based fix will replace this with a
+            // precise boundary lookup.
+            out.add(new Message(id, fetch.followerId(),
+                    new FetchResponse(epoch, log.size(), List.of(), highWatermark)));
+            return out;
+        }
         if (fetch.fromOffset() < log.size() || fetch.followerHighWatermark() < highWatermark) {
             // The follower is missing something - entries, watermark news,
             // or both. The second clause closes a real race: a fetch that
@@ -269,7 +290,15 @@ public final class Replica implements Node {
         if (response.epoch() < epoch || role != Role.FOLLOWER) {
             return List.of();
         }
-        if (response.fromOffset() != log.size()) {
+        if (response.fromOffset() < log.size()) {
+            // THE DESTRUCTION MOMENT of the buggy rule: the new leader's
+            // log is shorter than ours, and we conform by cutting ours
+            // down to match. If the cut range held committed entries, they
+            // are now gone from this replica - and if every other holder
+            // already did the same, gone from the world. The commit ledger
+            // still remembers the promise; the red test catches the lie.
+            log.subList((int) response.fromOffset(), log.size()).clear();
+        } else if (response.fromOffset() > log.size()) {
             throw new IllegalStateException("replica " + id + ": batch starts at "
                     + response.fromOffset() + " but log ends at " + log.size());
         }
