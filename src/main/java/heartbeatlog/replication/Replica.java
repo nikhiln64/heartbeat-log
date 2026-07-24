@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.TreeSet;
 
 /**
  * One copy of the telemetry log - a leader or a follower, decided by
@@ -29,14 +30,14 @@ import java.util.TreeMap;
  *                 leader HW)                 appends, adopts HW,
  *                                            immediately fetches again
  *
- *   High watermark (HW) = how many entries EVERY in-sync replica has.
+ *   High watermark (HW) = how many entries every IN-SYNC replica has.
  *   Only entries below the HW are "committed" - promised safe to clients.
  * </pre>
  *
  * ELI5: the leader keeps the class notebook; followers copy it page by
  * page, and each time a follower asks "what comes after page 6?" it is also
  * proving it HAS the first 6 pages. The teacher calls a page "safe" only
- * once every copier has it - that count is the high watermark.
+ * once every active copier has it - that count is the high watermark.
  *
  * Followers pull continuously: each response triggers the next request.
  * When a follower has copied everything and knows the latest watermark,
@@ -47,56 +48,107 @@ import java.util.TreeMap;
  * This is why an idle cluster goes quiet instead of ping-ponging empty
  * fetches. (Kafka does the same thing; it calls it long-polling.)
  *
+ * THE IN-SYNC ROSTER: the leader cannot wait forever for a dead follower,
+ * or the watermark would freeze and nothing would ever commit again. So it
+ * keeps a roster of followers that are keeping up. A follower that hasn't
+ * been caught up for {@code inSyncLagLimit} ticks is dropped from the
+ * roster (the watermark then advances without it); a dropped follower that
+ * catches back up to the watermark is re-admitted. Safety valve: if the
+ * roster shrinks below {@link #MIN_IN_SYNC_REPLICAS}, the leader REFUSES
+ * new writes - the cluster goes unavailable rather than making promises
+ * only one machine holds. (Kafka's names for these three knobs:
+ * replica.lag.time.max.ms, the ISR, and min.insync.replicas with acks=all.)
+ *
+ * CRASH AND RECOVERY: a crash wipes everything volatile (role, roster,
+ * waiting list); the log survives on disk. On recovery the replica applies
+ * its {@link TruncationRule} - under HIGH_WATERMARK it tears the log back
+ * to the last watermark it personally knew, which can be older than what
+ * the cluster committed. That gap is deliberate: it is the raw material of
+ * the KIP-101 red test in the next commits.
+ *
  * Epoch discipline on every message (the fencing rules): older epoch =>
  * ignore it; newer epoch => adopt it, and step down if leading. Entries are
- * stamped with the epoch they were appended under - the raw material the
- * KIP-101 truncation fix will reason about in later commits.
+ * stamped with the epoch they were appended under.
  */
 public final class Replica implements Node {
 
+    /**
+     * The durability floor: a write is only accepted while at least this
+     * many replicas (leader included) are in sync, so every commitment is
+     * held by at least 2 of 3 machines. Below the floor the cluster chooses
+     * unavailability over risky promises.
+     */
+    public static final int MIN_IN_SYNC_REPLICAS = 2;
+
     private final int id;
     private final CommitLedger ledger;
+    private final TruncationRule truncationRule;
+    private final long inSyncLagLimit;
 
-    private Role role = Role.FOLLOWER;
-    private long epoch = 0;
-    private int leaderId = -1;
+    // Durable state - survives a crash (simulated stable storage).
     private final List<Entry> log = new ArrayList<>();
+    private long epoch = 0;
     private long highWatermark = 0;
+    private int leaderId = -1;
 
-    // Leader-only bookkeeping. TreeMaps, not HashMaps: iteration order is
-    // part of message-send order, and determinism-on-any-machine forbids
-    // leaving that to hash-table internals.
+    // Volatile state - wiped by a crash.
+    private Role role = Role.FOLLOWER;
+    private boolean crashed = false;
+    private int refusedAppends = 0;
+
+    // Leader-only bookkeeping (volatile). TreeMaps/TreeSets, not hash
+    // variants: iteration order is part of message-send order, and
+    // determinism-on-any-machine forbids leaving that to hash internals.
     private final TreeMap<Integer, Long> followerLogEnds = new TreeMap<>();
     // The waiting list: followers that are fully caught up, remembered by
     // (follower id -> the offset they are waiting at) so the leader can
     // answer them the moment there is news instead of replying "nothing
     // new" in an endless loop.
     private final TreeMap<Integer, Long> waitingFollowers = new TreeMap<>();
+    // The in-sync roster, plus when each member was last fully caught up.
+    private final TreeSet<Integer> inSyncReplicas = new TreeSet<>();
+    private final TreeMap<Integer, Long> lastCaughtUpAt = new TreeMap<>();
+    // Where the log ended (and when) at each follower's PREVIOUS fetch -
+    // needed to recognize a healthy follower chasing a moving target: with
+    // a continuous write stream there is always one entry in flight, so
+    // "fromOffset >= log end right now" alone would never trigger and the
+    // roster would evict followers that are keeping up fine. (Kafka's
+    // Replica.updateFetchState has this same two-part rule.)
+    private final TreeMap<Integer, Long> previousFetchLogEnd = new TreeMap<>();
+    private final TreeMap<Integer, Long> previousFetchAt = new TreeMap<>();
     private List<Integer> replicaGroup = List.of();
 
-    public Replica(int id, CommitLedger ledger) {
+    public Replica(int id, CommitLedger ledger, TruncationRule truncationRule, long inSyncLagLimit) {
         this.id = id;
         this.ledger = ledger;
+        this.truncationRule = truncationRule;
+        this.inSyncLagLimit = inSyncLagLimit;
     }
 
     @Override
     public List<Message> step(long now, Object event) {
+        if (crashed) {
+            // Powered off: deaf to everything except the power switch.
+            return event instanceof Recover ? onRecover() : List.of();
+        }
         return switch (event) {
-            case LeaderAppointment appointment -> onAppointment(appointment);
-            case ClientAppend append -> onClientAppend(append);
-            case FetchRequest fetch -> onFetchRequest(fetch);
+            case LeaderAppointment appointment -> onAppointment(now, appointment);
+            case ClientAppend append -> onClientAppend(now, append);
+            case FetchRequest fetch -> onFetchRequest(now, fetch);
             case FetchResponse response -> onFetchResponse(response);
+            case Crash crash -> onCrash();
+            case Recover recover -> List.of(); // not crashed - nothing to recover from
             default -> throw new IllegalArgumentException("replica " + id + ": unknown event " + event);
         };
     }
 
     /**
      * A new leadership decree arrived: adopt the new epoch and take the
-     * assigned role. A fresh leader starts with empty bookkeeping (it will
-     * relearn follower positions from their fetches); a fresh follower
-     * immediately starts pulling the leader's log.
+     * assigned role. A fresh leader starts everyone on its roster with a
+     * full grace period (it will learn real positions from their fetches);
+     * a fresh follower immediately starts pulling the leader's log.
      */
-    private List<Message> onAppointment(LeaderAppointment appointment) {
+    private List<Message> onAppointment(long now, LeaderAppointment appointment) {
         // Fencing: a decree from an older (or repeated) leadership changes
         // nothing. Real appointments start at epoch 1; replicas begin at 0.
         if (appointment.epoch() <= epoch) {
@@ -107,9 +159,17 @@ public final class Replica implements Node {
         replicaGroup = appointment.replicas();
         followerLogEnds.clear();
         waitingFollowers.clear();
+        inSyncReplicas.clear();
+        lastCaughtUpAt.clear();
+        previousFetchLogEnd.clear();
+        previousFetchAt.clear();
 
         if (leaderId == id) {
             role = Role.LEADER;
+            for (int member : replicaGroup) {
+                inSyncReplicas.add(member);
+                lastCaughtUpAt.put(member, now);
+            }
             return List.of();
         }
         role = Role.FOLLOWER;
@@ -118,29 +178,38 @@ public final class Replica implements Node {
     }
 
     /**
-     * A client write arrived: the leader stamps it with the current epoch,
-     * appends it to its own log, and answers every follower on the waiting
-     * list - they were waiting precisely for new data like this.
+     * A client write arrived. If enough replicas are in sync, the leader
+     * stamps it with the current epoch, appends it, and answers everyone on
+     * the waiting list. If not, the write is REFUSED - unavailability over
+     * promises only one machine would hold.
      */
-    private List<Message> onClientAppend(ClientAppend append) {
+    private List<Message> onClientAppend(long now, ClientAppend append) {
         if (role != Role.LEADER) {
             // A real system would redirect the client to the leader;
             // out of scope here - the schedule always aims at the leader.
             return List.of();
         }
+        List<Message> out = new ArrayList<>(reviewInSyncRoster(now));
+        if (inSyncReplicas.size() < MIN_IN_SYNC_REPLICAS) {
+            refusedAppends++;
+            return out;
+        }
         log.add(new Entry(epoch, log.size(), append.payload()));
-        return answerWaitingFollowers();
+        out.addAll(answerWaitingFollowers(now));
+        return out;
     }
 
     /**
      * LEADER side: a follower is asking for entries from fromOffset onward.
-     * Three jobs in order: (1) treat the request as the follower's ack and
-     * note how much log it now holds, (2) recompute the high watermark with
-     * that new knowledge, (3) either answer the follower right away - it is
-     * missing entries or watermark news - or, if it is fully current, put it
-     * on the waiting list until there is something new to say.
+     * Jobs in order: (1) treat the request as the follower's ack and note
+     * how much log it now holds, (2) update the in-sync roster - this fetch
+     * may prove a dropped follower has caught back up, (3) recompute the
+     * high watermark with that new knowledge, (4) either answer the
+     * follower right away - it is missing entries or watermark news - or,
+     * if it is fully current, put it on the waiting list until there is
+     * something new to say.
      */
-    private List<Message> onFetchRequest(FetchRequest fetch) {
+    private List<Message> onFetchRequest(long now, FetchRequest fetch) {
         if (fetch.epoch() < epoch || role != Role.LEADER) {
             // Stale leadership or we aren't the leader (yet) - a real system
             // answers with an error; here the failover schedule re-appoints
@@ -149,9 +218,30 @@ public final class Replica implements Node {
         }
         // The fetch IS the ack: fromOffset proves the follower holds
         // everything below it.
-        followerLogEnds.put(fetch.followerId(), fetch.fromOffset());
+        int follower = fetch.followerId();
+        followerLogEnds.put(follower, fetch.fromOffset());
+        if (fetch.fromOffset() >= log.size()) {
+            // Fully caught up right now.
+            lastCaughtUpAt.put(follower, now);
+        } else if (fetch.fromOffset() >= previousFetchLogEnd.getOrDefault(follower, Long.MAX_VALUE)) {
+            // Caught up to where the log ended when it LAST asked - it is
+            // keeping pace with a moving target, which counts as of then.
+            // max(): this credit dates from the previous fetch and must
+            // never rewind a FRESHER stamp (e.g. from time spent on the
+            // waiting list, which counts as caught up continuously).
+            lastCaughtUpAt.merge(follower, previousFetchAt.getOrDefault(follower, now), Math::max);
+        }
+        previousFetchLogEnd.put(follower, (long) log.size());
+        previousFetchAt.put(follower, now);
+        // Re-admission: a dropped follower that has caught back up to the
+        // watermark rejoins the roster and counts for commitment again.
+        if (!inSyncReplicas.contains(fetch.followerId()) && fetch.fromOffset() >= highWatermark) {
+            inSyncReplicas.add(fetch.followerId());
+            lastCaughtUpAt.put(fetch.followerId(), now);
+        }
 
-        List<Message> out = new ArrayList<>(advanceHighWatermark());
+        List<Message> out = new ArrayList<>(reviewInSyncRoster(now));
+        out.addAll(advanceHighWatermark(now));
         if (fetch.fromOffset() < log.size() || fetch.followerHighWatermark() < highWatermark) {
             // The follower is missing something - entries, watermark news,
             // or both. The second clause closes a real race: a fetch that
@@ -189,14 +279,85 @@ public final class Replica implements Node {
     }
 
     /**
-     * HW = the smallest log end across the whole replica group (leader
+     * Power off. Everything volatile is gone; the log, epoch, watermark,
+     * and last known leader survive on simulated stable storage.
+     */
+    private List<Message> onCrash() {
+        crashed = true;
+        role = Role.FOLLOWER;
+        followerLogEnds.clear();
+        waitingFollowers.clear();
+        inSyncReplicas.clear();
+        lastCaughtUpAt.clear();
+        previousFetchLogEnd.clear();
+        previousFetchAt.clear();
+        return List.of();
+    }
+
+    /**
+     * Power back on: apply the truncation rule, then resume life as a
+     * follower of the last leader we knew. Under HIGH_WATERMARK the log is
+     * torn back to the last watermark THIS replica knew - possibly older
+     * than what the cluster committed. The tearing itself is safe as long
+     * as the replica refetches before ever leading; the KIP-101 red test
+     * will make it lead first.
+     */
+    private List<Message> onRecover() {
+        crashed = false;
+        role = Role.FOLLOWER;
+        if (truncationRule == TruncationRule.HIGH_WATERMARK && log.size() > highWatermark) {
+            log.subList((int) highWatermark, log.size()).clear();
+        }
+        if (leaderId != -1 && leaderId != id) {
+            return List.of(nextFetch());
+        }
+        // We led before crashing (or never heard of a leader): wait for the
+        // controller's next decree.
+        return List.of();
+    }
+
+    /**
+     * Drops from the roster every follower that hasn't been caught up
+     * within the lag limit. The watermark then advances without the
+     * laggard - the cluster keeps committing while a machine is down,
+     * which is the entire point of having replicas.
+     */
+    private List<Message> reviewInSyncRoster(long now) {
+        boolean changed = false;
+        for (int member : List.copyOf(inSyncReplicas)) {
+            if (member == id) {
+                continue;
+            }
+            if (waitingFollowers.containsKey(member)) {
+                // On the waiting list = fully caught up RIGHT NOW, by
+                // definition - it is silent because there is nothing to
+                // say, not because it is behind. Keep its clock fresh, or
+                // a long quiet stretch would read as lag and get a
+                // perfectly healthy follower evicted.
+                lastCaughtUpAt.put(member, now);
+                continue;
+            }
+            boolean laggingTooLong = now - lastCaughtUpAt.getOrDefault(member, 0L) > inSyncLagLimit
+                    && followerLogEnds.getOrDefault(member, 0L) < log.size();
+            if (laggingTooLong) {
+                inSyncReplicas.remove(member);
+                waitingFollowers.remove(member);
+                changed = true;
+            }
+        }
+        // Removing a laggard can be exactly what unblocks the watermark.
+        return changed ? advanceHighWatermark(now) : List.of();
+    }
+
+    /**
+     * HW = the smallest log end across the in-sync roster (leader
      * included). When it advances, every newly covered entry becomes a
      * commitment - recorded in the ledger - and every follower on the
      * waiting list is told the news.
      */
-    private List<Message> advanceHighWatermark() {
+    private List<Message> advanceHighWatermark(long now) {
         long minimum = log.size();
-        for (int member : replicaGroup) {
+        for (int member : inSyncReplicas) {
             if (member != id) {
                 minimum = Math.min(minimum, followerLogEnds.getOrDefault(member, 0L));
             }
@@ -208,7 +369,7 @@ public final class Replica implements Node {
             ledger.recordCommitted(log.get((int) offset));
         }
         highWatermark = minimum;
-        return answerWaitingFollowers();
+        return answerWaitingFollowers(now);
     }
 
     /**
@@ -216,9 +377,13 @@ public final class Replica implements Node {
      * gets a response carrying whatever is new since it started waiting -
      * fresh entries, a moved watermark, or both.
      */
-    private List<Message> answerWaitingFollowers() {
+    private List<Message> answerWaitingFollowers(long now) {
         List<Message> out = new ArrayList<>();
         for (Map.Entry<Integer, Long> waiting : waitingFollowers.entrySet()) {
+            // They were fully current until this very moment - stamp it, so
+            // the round-trip of the answer we are about to send does not
+            // read as lag.
+            lastCaughtUpAt.put(waiting.getKey(), now);
             out.add(fetchResponseFor(waiting.getKey(), waiting.getValue()));
         }
         waitingFollowers.clear();
@@ -260,5 +425,17 @@ public final class Replica implements Node {
 
     public long epoch() {
         return epoch;
+    }
+
+    public boolean crashed() {
+        return crashed;
+    }
+
+    public List<Integer> inSyncReplicas() {
+        return List.copyOf(inSyncReplicas);
+    }
+
+    public int refusedAppends() {
+        return refusedAppends;
     }
 }

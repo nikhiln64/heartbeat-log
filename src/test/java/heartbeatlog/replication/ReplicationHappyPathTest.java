@@ -35,6 +35,10 @@ class ReplicationHappyPathTest {
     //   replication happens" sequence.
     private static final long FIRST_WRITE_AT = 5;
     private static final long WRITE_INTERVAL = 3;
+    // Roster patience - irrelevant on the happy path (nobody lags; a
+    // follower waiting for news still counts as caught up), but the
+    // constructor requires a value.
+    private static final long LAG_LIMIT = 20;
 
     private record Cluster(Simulation simulation, List<Replica> replicas, CommitLedger ledger) {}
 
@@ -50,7 +54,7 @@ class ReplicationHappyPathTest {
         CommitLedger ledger = new CommitLedger();
         List<Replica> replicas = new ArrayList<>();
         for (int i = 0; i < REPLICAS; i++) {
-            Replica replica = new Replica(i, ledger);
+            Replica replica = new Replica(i, ledger, TruncationRule.HIGH_WATERMARK, LAG_LIMIT);
             replicas.add(replica);
             simulation.addNode(replica);
         }
